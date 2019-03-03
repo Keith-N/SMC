@@ -91,7 +91,6 @@ float maxYaw = 70.0*deg2rad;
 
 //Hardware Paramaters//
 float gyroSense = 65.5/deg2rad;               // [LSB/(rad/s)] Gyro Sensitivity
-float accSense = 57.296*deg2rad;              // [(rad/s)/LSB] Accelerometer Sensitivity
 float vMax = 555;                             // [rad/s] Maximum Motor Velocity
 float dt;                                     // [s] Main Loop Period
 
