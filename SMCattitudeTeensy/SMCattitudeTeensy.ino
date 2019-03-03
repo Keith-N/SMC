@@ -32,7 +32,6 @@
 //Preliminary Commands
 ///////////////////////////////////////////////////////////////////////////////////////
 
-
 ///////////////////////////////////////CHANGE LOG//////////////////////////////////////
 // (3/1/2019)/////////
 // - Gyro register function changed to match Teensy Code
@@ -42,30 +41,31 @@
 // - Added Configuration\ESC variables
 // - Made changes to Setup to match Keith's Flight Controller Code
 // - Buad Rate for Teensy code set at 115200, compared to Arduino's 57600
+// (3/2/2019)/////////
+// - Added various sections from Keith's Flight Controller Code
+// - Removed old methods for calcuating esc pulses and reading receiver signals
+// - Changed some integers to floats to solve some large value errors
+// - Some slight style changes throughout
+// - Changed the names of a few variables to match old SMC naming scheme
+// - Changed eYaw to 0 to try and counter yaw's drift
+// - Put functions that only run once into setup except the gyro registers function
+// - Converted Keith's values in degrees to radians
+// - Negated inverted receiver channels
+// - Changed loop time used in smc() from 4000 [us] to measured loop time.
+// - Removed some variables that are no longer used.
+// - Increased Transmitter dead band from 10 [us] to 20 [us]
+// - Added if statements to handle nan values 
+// - Removed portion of code that converts receiver signals
+// - Similified esc max and min output if statement
+// - Removed battery volatge compensation because hardware is not ready yet.
 //////////////////////////////////////////////////////////////////////////////////////
 
-
 //Additional Libraries//
+#include <Arduino.h>
 #include <Wire.h>             // Gyroscope Communication
-#include <EEPROM.h>           // Reading EEPROM Calibration Information
 
 //Unit Conversions//
 float deg2rad = PI/180;       // [rad/deg]
-
-//////////////////////////////////////////////////////////////////////////
-// Configurations
-//////////////////////////////////////////////////////////////////////////
-
-// PWM Settings
- int pwmFreq = 250;
- int pwmRes = 8;
- bool debug = true;
-
-// Total pulse length for esc
- int escPulseTime = 4000;
-
-//Auto level on (true) or off (false)
-boolean auto_level = true;                
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //User Initialized Global Variables
@@ -92,15 +92,12 @@ float maxYaw = 70.0*deg2rad;
 //Hardware Paramaters//
 float gyroSense = 65.5/deg2rad;               // [LSB/(rad/s)] Gyro Sensitivity
 float accSense = 57.296*deg2rad;              // [(rad/s)/LSB] Accelerometer Sensitivity
-float dt = 0.004;                             // [s] Main Loop Period (1/250 [Hz])
 float vMax = 555;                             // [rad/s] Maximum Motor Velocity
-byte diode = 65;                              // Diode Voltage Compensation
+float dt;                                     // [s] Main Loop Period
 
 ///Quadcopter Physical Parameters//
 float Kf = 0.0000158;                         // [N-s2] Aerodynamic Force Constant
-// Actual Kf value = 6.3338E-5
-float Km = 0.00000029;                        // [N-m-s2] Aerodynamic Moment Constant
-// Actual Km value = 2.8325E-7
+float Km = 0.00000029;                          // [N-m-s2] Aerodynamic Moment Constant
 float Ixx = 0.01548;                          // [kg/m2] Moment of Inertia Around x Axis
 float Iyy = 0.01565;                          // [kg/m2] Moment of Inertia Around y Axis
 float Izz = 0.03024;                          // [kg/m2] Moment of Inertia Around z Axis
@@ -108,6 +105,66 @@ float Jr = 0.00006;                           // [kg/m2] Rotor Inertia
 float len = 0.17;                             // [m] Quadcopter Arm Length
 float g = 9.81;                               // [m/s] Gravitational Acceleration
 float mass = 0.98;                            // [kg] Quadcopter Total Mass
+
+// PWM Settings
+int pwmFreq = 250;
+int pwmRes = 8;
+bool debug = true;
+
+// Total pulse length for esc
+int escPulseTime = 4000;
+
+int pidDiv = 3;                            // Adjust scaling for rad/s response (500-8)/pidDiv
+int delayTimer = 3600;                        // Setup a delay timer in uS
+
+/////////PINS////////////
+
+// ESC Pins
+int escOut1 = 5;
+int escOut2 = 6;
+int escOut3 = 10;
+int escOut4 = 20;
+
+int led = 13;
+
+//Rx Pins
+int ch1 = 7;
+int ch2 = 8;
+int ch3 = 14;
+int ch4 = 35;
+int ch5 = 33;
+int ch6 = 34;
+
+// Receiver Pulses {Pitch, Roll, Heave, Yaw}
+
+// Timing Variables for Pulse Width
+unsigned long prev1 = 0;
+volatile unsigned long R1 = 1500;
+unsigned long prev2 = 0;
+volatile unsigned long R2 = 1500;
+unsigned long prev3 = 0;
+volatile unsigned long R3 = 1500;
+unsigned long prev4 = 0;
+volatile unsigned long R4 = 1500;
+unsigned long prev5 = 0;
+volatile unsigned long R5 = 1500;
+unsigned long prev6 = 0;
+volatile unsigned long R6 = 1500;
+
+int esc1PWM;
+int esc2PWM;
+int esc3PWM;
+int esc4PWM;
+
+elapsedMicros elapsedTime;
+unsigned long escLoopTime = 0;
+unsigned long timer_channel_1 = 0;
+
+int16_t accX, accY, accZ, GyX, GyY, GyZ;
+int16_t accX_Cal,accY_Cal,accZ_Cal;
+int16_t GyX_Cal = 0;
+int16_t GyY_Cal = 0;
+int16_t GyZ_Cal = 0;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //System Initialized Global Variables
@@ -127,44 +184,22 @@ float b3=1/Izz;
 float u1, u2, u3, u4;                           // Thrust Forces {Heave, Pitch, Roll, Yaw}
 float w1, w2, w3, w4;                           // Rotor Velocities {Front (ccw), Right (cw), Back (ccw), Left(cw)}
 int esc1, esc2, esc3, esc4;                     // ESC Pulse Widths {Front (ccw), Right (cw), Back (ccw), Left(cw)}
-unsigned long tCH1, tCH2, tCH3, tCH4;
-unsigned long t1, t2, t3, t4, currentTime;
-unsigned long loopTimer, escTimer, escLoopTimer;
 
-// ESC Pins
- int escOut1 = 5;
- int escOut2 = 6;
- int escOut3 = 10;
- int escOut4 = 20;
-
-//Receiver//
-//Rx Pins
- int ch1 = 7;
- int ch2 = 8;
- int ch3 = 14;
- int ch4 = 35;
- int ch5 = 33;
- int ch6 = 34;
-volatile int R1, R2, R3, R4, R5, R6;                            // Receiver Pulses {Pitch, Roll, Heave, Yaw}
+//Receiver//            
 float pitchDes, rollDes, yawDes;                        // Desired Euler Angles
 float pitchDesD1, rollDesD1, yawDesD1;                  // Desired Euler Angular Rates
 float pitchDesD1old, rollDesD1old, yawDesD1old;         // Last Loop Rate
 float pitchDesD2, rollDesD2, yawDesD2;                  // Rate Derivative
-int receiverIN[5];
-byte lastCH1, lastCH2, lastCH3, lastCH4;
 float throttle;
 
 //Gyroscope//
 float gyroPitch, gyroRoll, gyroYaw;   //Euler Angles
-int gyroAxis[4], calcInt, gAdd = 0x68;
+int calcInt, gAdd = 0x68;
 boolean gyroAnglesSet;
-double gyroAxisCal[4];
 
 //Accelerometer//
-int accAxis[4];
 float accRoll, accPitch;        //Euler Angles
 long accX, accY, accZ, accA;    //Accelerations {x, y, z, Total Vector}
-
 
 //Sliding Mode Controller//
 float pitch, roll, yaw;             //Euler Angles
@@ -175,103 +210,61 @@ float sPitch, sRoll, sYaw;          //Sliding Surfaces
 
 //Misc//
 float yawADD;           //Speed up loop
-int start;              //Motor start
-int batV;               //Battery Voltage
+int start = 0;              //Motor start
 int temp;               //IMU temp Variable
-byte eeData[36];        //EEprom Data
-int led = 13;
-byte highByte, lowByte;
+
+// Get maximum value for selected PWM resolution (100% Duty)
+int pwmMax = 256;
+// Initializing pulse for ESCs, 25% duty
+int escInit = pwmMax/4;
+const int MPU_addr=0x68;  // I2C address of the MPU-6050
+boolean first_angle;
+unsigned long loopTimer = 1563;
+unsigned long timer1;
+long printTimer;
+unsigned long prevLoop = 0;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //Setup routine
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void setup(){
-  //Serial.begin(57600);
   
-  //Initial General Setup Tasks//
-  /*for(start = 0; start <= 35; start++)eeData[start] = EEPROM.read(start); //Import EEPROM Data
-  start = 0;                                                                //Set start back to zero.
-  gAdd = eeData[32];                                                        //Gyro Address
-  Wire.begin();                                                             //Start the I2C as master.
-  TWBR = 12;                                                                //Set the I2C clock speed to 400kHz
-  DDRD |= B11110000;                                                        //Set digital ports 4, 5, 6 and 7 as outputs.
-  DDRB |= B00110000;                                                        //Set digital ports 12 and 13 as outputs.*/
+  Serial.begin(5000000);
 
-  pinMode(led,OUTPUT);
-  Serial.begin(115200);
-
-  //Setup IMU
-  //I2C
+  //Warning LED//
+  pinMode(led,OUTPUT); 
+  digitalWrite(led,HIGH); //Setup has begun LED ON
+                     
+  //Setup I2C Gyro Communication
   Wire.begin();
-  Wire.setClock(5000000);
-  digitalWrite(13,HIGH);                                                    //Turn on the warning led.
+  Wire.setClock(5000000);  
+                                                 
+  //Set Gyro Registers//
+  gyroRegisters();
 
-//  //Check the EEPROM signature to make sure that the setup program is executed.
-//  while(eeData[33] != 'J' || eeData[34] != 'M' || eeData[35] != 'B')delay(10);
-//
-//  if(eeData[31] == 2 || eeData[31] == 3)delay(10); //If setup is completed without MPU-6050 stop the flight controller program 
-
-  //Gyro DC Offset Calibration//
-  gyroRegisters();   //Set the specific gyro registers.
-
-//  //Wait 5 Seconds//
-//  for (calcInt = 0; calcInt < 1250 ; calcInt ++){                           
-//    PORTD |= B11110000;                                                     // Motor pins 4, 5, 6 and 7 high
-//    delayMicroseconds(1000);                                                // Wait
-//    PORTD &= B00001111;                                                     // Motor pins 4, 5, 6 and 7 low
-//    delayMicroseconds(3000);                                                // Wait
-//  }
-
-  //Take Gyro Calibration Readings//
-  for (calcInt = 0; calcInt < 2000 ; calcInt ++){                           //Take 2000 readings for calibration.
-    if(calcInt % 15 == 0)digitalWrite(13, !digitalRead(13));                //Change the led status to indicate calibration.
-    gyro_signalen();                                                        // Read the gyro output.
-    gyroAxisCal[1] += gyroAxis[1];                                          // Add roll value to gyroRoll_cal.
-    gyroAxisCal[2] += gyroAxis[2];                                          // Add pitch value to gyroPitch_cal.
-    gyroAxisCal[3] += gyroAxis[3];                                          // Add yaw value to gyroYaw_cal.
-    
-//    //Prevent ESC Beeping//
-//    PORTD |= B11110000;                                                     // Motor pins 4, 5, 6 and 7 high
-//    delayMicroseconds(1000);                                                // Wait
-//    PORTD &= B00001111;                                                     // Motor Pins 4, 5, 6 and 7 low
-      delay(3);                                                               // Wait
+  //Gyro Calibration//
+  for(calcInt =0; calcInt<2000; calcInt++ )
+  {
+    gyro_signalen();
+    GyX_Cal = GyX+GyX_Cal;
+    GyY_Cal = GyY+GyY_Cal;
+    GyZ_Cal = GyZ+GyZ_Cal;
+    delay(100);
   }
+   //Average DC Offset//
+   GyX_Cal = GyX_Cal/2000;
+   GyY_Cal = GyY_Cal/2000;
+   GyZ_Cal = GyZ_Cal/2000;
 
-  //Average DC Offset//
-  gyroAxisCal[1] /= 2000;               // Roll
-  gyroAxisCal[2] /= 2000;               // Pitch
-  gyroAxisCal[3] /= 2000;               // Yaw 
 
-  //Enable Pin Change Interrupts//
-//  PCICR |= (1 << PCIE0);                //Set PCIE0 to enable PCMSK0 scan.
-//  PCMSK0 |= (1 << PCINT0);              // Pin 8
-//  PCMSK0 |= (1 << PCINT1);              // Pin 9
-//  PCMSK0 |= (1 << PCINT2);              // Pin 10
-//  PCMSK0 |= (1 << PCINT3);              // Pin 11
-  attachInterrupt(ch1,ch1Int,CHANGE);
-  attachInterrupt(ch2,ch2Int,CHANGE);
-  attachInterrupt(ch3,ch3Int,CHANGE);
-  attachInterrupt(ch4,ch4Int,CHANGE);
-  attachInterrupt(ch5,ch5Int,CHANGE);
-  attachInterrupt(ch6,ch6Int,CHANGE);
+  // Setup ESC Pins
+  pinMode(escOut1, OUTPUT);
+  pinMode(escOut2, OUTPUT);
+  pinMode(escOut3, OUTPUT);
+  pinMode(escOut4, OUTPUT);
 
-//  //Receiver On & Throttle Low?//
-//  while(R3 < 990 || R3 > 1020 || R4 < 1400){
-//    R3 = convertReceiver(3);                 //Convert the actual receiver signals for throttle to the standard 1000 - 2000us
-//    R4 = convertReceiver(4);                 //Convert the actual receiver signals for yaw to the standard 1000 - 2000us
-//    start ++;                                                               //While waiting increment start whith every loop.
-//    //We don't want the esc's to be beeping annoyingly. So let's give them a 1000us puls while waiting for the receiver inputs.
-//    PORTD |= B11110000;                                                     //Set digital poort 4, 5, 6 and 7 high.
-//    delayMicroseconds(1000);                                                //Wait 1000us.
-//    PORTD &= B00001111;                                                     //Set digital poort 4, 5, 6 and 7 low.
-//    delay(3);                                                               //Wait 3 milliseconds before the next loop.
-//    if(start == 125){                                                       //Every 125 loops (500ms).
-//      digitalWrite(13, !digitalRead(13));                                   //Change the led status.
-//      start = 0;                                                            //Start again at 0.
-//    }
-//  }
-
+  
   // All on Timer FTM0 -> pwmFreq
   analogWriteFrequency(escOut1, pwmFreq);
 
@@ -279,59 +272,138 @@ void setup(){
   analogWriteResolution(pwmRes);
 
   // Initialize ESCs
-  
   analogWrite(escOut1, escInit);
   analogWrite(escOut2, escInit);
   analogWrite(escOut3, escInit);
   analogWrite(escOut4, escInit);
   delay(5000);
-  
-  // Turn on LED exit setup 
-  digitalWrite(led,HIGH);
 
-  //Final General Setup Tasks//
-  start = 0;                                                               
-  batV = (analogRead(0) + 65) * 1.2317;                                    // Read battery voltage
+  //Enable Pin Change Interrupts//
+  attachInterrupt(ch1,ch1Int,CHANGE);
+  attachInterrupt(ch2,ch2Int,CHANGE);
+  attachInterrupt(ch3,ch3Int,CHANGE);
+  attachInterrupt(ch4,ch4Int,CHANGE);
+  attachInterrupt(ch5,ch5Int,CHANGE);
+  attachInterrupt(ch6,ch6Int,CHANGE);                                                        
+  
   loopTimer = micros();                                                    // Set the timer for the next loop.
-  digitalWrite(13,LOW);                                                    // Turn off startup indicator LED
+  digitalWrite(led,LOW); //Setup Complete LED
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //Main program loop
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void loop(){
+/** Debug Section
+
+  //Receiver Signals//
+  Serial.println("R1");
+  Serial.println(R1);
+  Serial.println("R2");
+  Serial.println(R2);
+  Serial.println("R3");
+  Serial.println(R3);
+  Serial.println("R4");
+  Serial.println(R4);
+
+  //Gyro Angles//
+  Serial.println("ROLL");
+  Serial.println(roll/deg2rad);
+  Serial.println("PITCH");
+  Serial.println(pitch/deg2rad);
+  Serial.println("YAW");
+  Serial.println(yaw/deg2rad);
+
+  //ESC//
+  Serial.println("ESC1");
+  Serial.println(esc1);
+  Serial.println("ESC2");
+  Serial.println(esc2);
+  Serial.println("ESC3");
+  Serial.println(esc3);
+  Serial.println("ESC4");
+  Serial.println(esc4);
+
+  //w//
+  Serial.println("w1");
+  Serial.println(w1);
+  Serial.println("w2");
+  Serial.println(w2);
+  Serial.println("w3");
+  Serial.println(w3);
+  Serial.println("w4");
+  Serial.println(w4);
+
+
+  Serial.println("u1");
+  Serial.println(u1);
+  Serial.println("u2");
+  Serial.println(u2);
+  Serial.println("u3");
+  Serial.println(u3);
+  Serial.println("u4");
+  Serial.println(u4);
+
+  
+  Serial.println("ePitchD1");
+  Serial.println(ePitchD1);
+  Serial.println("eRollD1");
+  Serial.println(eRollD1);
+  Serial.println("eYawD1");
+  Serial.println(eYawD1);
+
+   
+
+  Serial.println("ePitchD1");
+  Serial.println(ePitchD1);
+  Serial.println("eRollD1");
+  Serial.println(eRollD1);
+  Serial.println("eYawD1");
+  Serial.println(eYawD1);
+  
+   **/ 
+   
+  //Setup timer for IMU loop calcs and get current measurement
+  timer1 = elapsedTime;
+
+  gyro_signalen();
     
   //Gyro Rate Filter [rad/s]//
   rollD1 = (rollD1 * 0.7) + (gyroRoll* 0.3);
   pitchD1 = (pitchD1 * 0.7) + (gyroPitch* 0.3);
   yawD1 = (yawD1 * 0.7) + (gyroYaw * 0.3);
-  
-  //Gyro Angles [rad]//
-  pitch += gyroPitch*dt;
-  roll += gyroRoll*dt;                                      
-  yaw += gyroYaw*dt;                                       
-  
-  //Yawing Angle Adjustment//
-  yawADD=sin(gyroYaw*dt);
-  pitch -= roll * yawADD;                  //If the IMU has yawed transfer the roll angle to the pitch angle.
-  roll += pitch * yawADD;                  //If the IMU has yawed transfer the pitch angle to the roll angle.
 
+ //Gyro_angle calculations
+
+  dt = loopTimer * 0.000001;
+  //Gyro Angles [rad]//
+  pitch += gyroPitch * dt;       
+  roll += gyroRoll * dt;
+  yaw += gyroYaw * dt;        
+
+  //Yawing Angle Adjustment//
+  pitch -= roll * sin(gyroYaw * dt);  //If the IMU has yawed transfer the roll angle to the pitch angle.                       
+  roll += pitch * sin(gyroYaw * dt);  //If the IMU has yawed transfer the pitch angle to the roll angle.
+                                   
   //Accelerometer angle calculations
   accA = sqrt((accX*accX)+(accY*accY)+(accZ*accZ));       //Calculate the total accelerometer vector.
   
   if(abs(accY) < accA){                                        //Prevent the asin function to produce a NaN
-    accPitch = asin((float)accY/accA)*accSense;          //Calculate the pitch angle.
+    accPitch = asin((float)accY/accA);          //Calculate the pitch angle.
   }
   if(abs(accX) < accA){                                        //Prevent the asin function to produce a NaN
-    accRoll = asin((float)accX/accA)*-accSense;          //Calculate the roll angle.
+    accRoll = -asin((float)accX/accA);          //Calculate the roll angle.
   }
-  
-  //Place the MPU-6050 spirit level and note the values in the following two lines for calibration.
-  accPitch += 1.785060514*PI/180.0;                                                   //Accelerometer calibration value for pitch.
-  accRoll -= 0;                                                    //Accelerometer calibration value for roll.
 
-  //Complementary Filter//
-  pitch = pitch * 0.9996 + accPitch * 0.0004;            //Correct the drift of the gyro pitch angle with the accelerometer pitch angle.
-  roll = roll * 0.9996 + accRoll * 0.0004;               //Correct the drift of the gyro roll angle with the accelerometer roll angle.
+  
+  if(!first_angle){
+    pitch = accPitch;                                                 //Set the pitch angle to the accelerometer angle.
+    roll = accRoll;                                                   //Set the roll angle to the accelerometer angle.
+    first_angle = true;
+ }
+ else{
+   pitch = pitch * 0.998 + accPitch * 0.002;                 //Correct the drift of the gyro pitch angle with the accelerometer pitch angle.
+   roll = roll * 0.998 + accRoll * 0.002;                    //Correct the drift of the gyro roll angle with the accelerometer roll angle.
+ }
 
   //Start Motors//
   if(R3 < 1050 && R4 < 1050)start = 1; //For starting the motors: throttle low and yaw left (step 1).
@@ -360,39 +432,17 @@ void loop(){
 
   smc();                                                            //PID inputs are known. So we can calculate the pid output.  
 
-  //The battery voltage is needed for compensation.
-  //A complementary filter is used to reduce noise.
-  //0.09853 = 0.08 * 1.2317.
-  batV = batV * 0.92 + (analogRead(0) + 65) * 0.09853;
-
-  //Turn on the led if battery voltage is to low.
-  if(batV < 1000 && batV > 600)digitalWrite(13, HIGH);
-
-
   throttle = R3;                                      //We need the throttle signal as a base signal.
 
   if (start == 2){                                                          //The motors are started.
-    if (batV < 1240 && batV > 800){                   //Is the battery connected?
-      //Voltage Compensation//
-      esc1 += esc1 * ((1240 - batV)/(float)3500);            
-      esc2 += esc2 * ((1240 - batV)/(float)3500);           
-      esc3 += esc3 * ((1240 - batV)/(float)3500);              
-      esc4 += esc4 * ((1240 - batV)/(float)3500);             
-    } 
-    //Keep Motors Running//
-    if (esc1 < 1100) esc1 = 1100;                                       
-    if (esc2 < 1100) esc2 = 1100;                                     
-    if (esc3 < 1100) esc3 = 1100;                                        
-    if (esc4 < 1100) esc4 = 1100;                                         
-
-    //Max Pulse//
-    if(esc1 > 2000)esc1 = 2000;                                        
-    if(esc2 > 2000)esc2 = 2000;                                        
-    if(esc3 > 2000)esc3 = 2000;                                        
-    if(esc4 > 2000)esc4 = 2000;                                      
+    //ESC Limits//
+    esc1 = (esc1 < 1100) ? 1100 : (esc1 > 2000) ? 2000 : esc1;
+    esc2 = (esc2 < 1100) ? 1100 : (esc2 > 2000) ? 2000 : esc2;
+    esc3 = (esc3 < 1100) ? 1100 : (esc3 > 2000) ? 2000 : esc3;
+    esc4 = (esc4 < 1100) ? 1100 : (esc4 > 2000) ? 2000 : esc4;                               
   }
 
-  //Min Pulse//
+  //Motors Off
   else{
     esc1 = 1000;                                                 
     esc2 = 1000;                                                      
@@ -400,320 +450,26 @@ void loop(){
     esc4 = 1000;                                       
   }
 
-  ////////////////////////////////////////////////////////////////////////////////////////////////////
-  //Creating ESC Pulses
-  ////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Calculate ESC pulse for PWM resolution
+  esc1PWM = esc1*(pwmMax)/escPulseTime;
+  esc2PWM = esc2*(pwmMax)/escPulseTime;
+  esc3PWM = esc3*(pwmMax)/escPulseTime;
+  esc4PWM = esc4*(pwmMax)/escPulseTime;
 
-  if(micros() - loopTimer > 4050)digitalWrite(13, HIGH);                   //Turn on the LED if the loop time exceeds 4050us.
-  
-  //All the information for controlling the motor's is available.
-  //The refresh rate is 250Hz. That means the esc's need there pulse every 4ms.
-  while(micros() - loopTimer < 4000);                                      //We wait until 4000us are passed.
-  loopTimer = micros();                                                    //Set the timer for the next loop.
+  //Create PWM for ESCs
+  analogWrite(escOut1,esc1PWM);
+  analogWrite(escOut2,esc2PWM);
+  analogWrite(escOut3,esc3PWM);
+  analogWrite(escOut4,esc4PWM);
 
-  //ESC Falling Edge Calculations//
-  PORTD |= B11110000;                                                       //Set digital outputs 4,5,6 and 7 high.
-  tCH1 = esc1 + loopTimer;                                  
-  tCH2 = esc2 + loopTimer;                                  
-  tCH3 = esc3 + loopTimer;                                     
-  tCH4 = esc4 + loopTimer;                                    
-  
-  //There is always 1000us of spare time. So let's do something usefull that is very time consuming.
-  //Get the current gyro and receiver data and scale it to degrees per second for the pid calculations.
-  gyro_signalen();
+  delayMicroseconds(delayTimer);
+  loopTimer = elapsedTime  - timer1;
 
-  while(PORTD >= 16){                                                       //Stay in this loop until output 4,5,6 and 7 are low.
-    escLoopTimer = micros();                                              //Read the current time.
-    if(tCH1 <= escLoopTimer)PORTD &= B11101111;                //Set digital output 4 to low if the time is expired.
-    if(tCH2 <= escLoopTimer)PORTD &= B11011111;                //Set digital output 5 to low if the time is expired.
-    if(tCH3 <= escLoopTimer)PORTD &= B10111111;                //Set digital output 6 to low if the time is expired.
-    if(tCH4 <= escLoopTimer)PORTD &= B01111111;                //Set digital output 7 to low if the time is expired.
-  }
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Reading Receiver Signals 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-ISR(PCINT0_vect){
-  currentTime = micros();
-  //Channel 1=========================================
-  if(PINB & B00000001){                                                     //Is input 8 high?
-    if(lastCH1 == 0){                                                //Input 8 changed from 0 to 1.
-      lastCH1 = 1;                                                   //Remember current input state.
-      t1 = currentTime;                                               //Set t1 to currentTime.
-    }
-  }
-  else if(lastCH1 == 1){                                             //Input 8 is not high and changed from 1 to 0.
-    lastCH1 = 0;                                                     //Remember current input state.
-    receiverIN[1] = currentTime - t1;                             //Channel 1 is currentTime - t1.
-  }
-  //Channel 2=========================================
-  if(PINB & B00000010 ){                                                    //Is input 9 high?
-    if(lastCH2 == 0){                                                //Input 9 changed from 0 to 1.
-      lastCH2 = 1;                                                   //Remember current input state.
-      t2 = currentTime;                                               //Set t2 to currentTime.
-    }
-  }
-  else if(lastCH2 == 1){                                             //Input 9 is not high and changed from 1 to 0.
-    lastCH2 = 0;                                                     //Remember current input state.
-    receiverIN[2] = currentTime - t2;                             //Channel 2 is currentTime - t2.
-  }
-  //Channel 3=========================================
-  if(PINB & B00000100 ){                                                    //Is input 10 high?
-    if(lastCH3 == 0){                                                //Input 10 changed from 0 to 1.
-      lastCH3 = 1;                                                   //Remember current input state.
-      t3 = currentTime;                                               //Set t3 to currentTime.
-    }
-  }
-  else if(lastCH3 == 1){                                             //Input 10 is not high and changed from 1 to 0.
-    lastCH3 = 0;                                                     //Remember current input state.
-    receiverIN[3] = currentTime - t3;                             //Channel 3 is currentTime - t3.
-
-  }
-  //Channel 4=========================================
-  if(PINB & B00001000 ){                                                    //Is input 11 high?
-    if(lastCH4 == 0){                                                //Input 11 changed from 0 to 1.
-      lastCH4 = 1;                                                   //Remember current input state.
-      t4 = currentTime;                                               //Set t4 to currentTime.
-    }
-  }
-  else if(lastCH4 == 1){                                             //Input 11 is not high and changed from 1 to 0.
-    lastCH4 = 0;                                                     //Remember current input state.
-    receiverIN[4] = currentTime - t4;                             //Channel 4 is currentTime - t4.
-  }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//Reading Gyroscope and Accelerometer Angles
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-void gyro_signalen(){
-  /*//Read the MPU-6050
-  if(eeData[31] == 1){
-    Wire.beginTransmission(gAdd);                                   //Start communication with the gyro.
-    Wire.write(0x3B);                                                       //Start reading @ register 43h and auto increment with every read.
-    Wire.endTransmission();                                                 //End the transmission.
-    Wire.requestFrom(gAdd,14);                                      //Request 14 bytes from the gyro.
-    
-    R1 = convertReceiver(1);                 //Convert the actual receiver signals for pitch to the standard 1000 - 2000us.
-    R2 = convertReceiver(2);                 //Convert the actual receiver signals for roll to the standard 1000 - 2000us.
-    R3 = convertReceiver(3);                 //Convert the actual receiver signals for throttle to the standard 1000 - 2000us.
-    R4 = convertReceiver(4);                 //Convert the actual receiver signals for yaw to the standard 1000 - 2000us.
-    
-    while(Wire.available() < 14);                                           //Wait until the 14 bytes are received.
-    accAxis[1] = Wire.read()<<8|Wire.read();                               //Add the low and high byte to the accX variable.
-    accAxis[2] = Wire.read()<<8|Wire.read();                               //Add the low and high byte to the accY variable.
-    accAxis[3] = Wire.read()<<8|Wire.read();                               //Add the low and high byte to the accZ variable.
-    temp = Wire.read()<<8|Wire.read();                               //Add the low and high byte to the temp variable.
-    gyroAxis[1] = Wire.read()<<8|Wire.read();                              //Read high and low part of the angular data.
-    gyroAxis[2] = Wire.read()<<8|Wire.read();                              //Read high and low part of the angular data.
-    gyroAxis[3] = Wire.read()<<8|Wire.read();                              //Read high and low part of the angular data.
-  }
-
-  if(calcInt == 2000){
-    gyroAxis[1] -= gyroAxisCal[1];                                       //Only compensate after the calibration.
-    gyroAxis[2] -= gyroAxisCal[2];                                       //Only compensate after the calibration.
-    gyroAxis[3] -= gyroAxisCal[3];                                       //Only compensate after the calibration.
-  }
-  gyroRoll = gyroAxis[eeData[28] & 0b00000011]/gyroSense;                      //Set gyroRoll to the correct axis that was stored in the EEPROM.
-  if(eeData[28] & 0b10000000)gyroRoll *= -1;                          //Invert gyroRoll if the MSB of EEPROM bit 28 is set.
-  gyroPitch = gyroAxis[eeData[29] & 0b00000011]/gyroSense;                     //Set gyroPitch to the correct axis that was stored in the EEPROM.
-  if(eeData[29] & 0b10000000)gyroPitch *= -1;                         //Invert gyroPitch if the MSB of EEPROM bit 29 is set.
-  gyroYaw = gyroAxis[eeData[30] & 0b00000011]/gyroSense;                       //Set gyroYaw to the correct axis that was stored in the EEPROM.
-  if(eeData[30] & 0b10000000)gyroYaw *= -1;                           //Invert gyroYaw if the MSB of EEPROM bit 30 is set.
-
-  accX = accAxis[eeData[29] & 0b00000011];                           //Set accX to the correct axis that was stored in the EEPROM.
-  if(eeData[29] & 0b10000000)accX *= -1;                              //Invert accX if the MSB of EEPROM bit 29 is set.
-  accY = accAxis[eeData[28] & 0b00000011];                           //Set accY to the correct axis that was stored in the EEPROM.
-  if(eeData[28] & 0b10000000)accY *= -1;                              //Invert accY if the MSB of EEPROM bit 28 is set.
-  accZ = accAxis[eeData[30] & 0b00000011];                           //Set accZ to the correct axis that was stored in the EEPROM.
-  if(eeData[30] & 0b10000000)accZ *= -1;                              //Invert accZ if the MSB of EEPROM bit 30 is set.*/
-
-  Wire.beginTransmission(gadd);
-  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
-  Wire.endTransmission(false);
-  Wire.requestFrom(gadd,14,true);  // request a total of 14 registers
-  accX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
-  accY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  accZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-  temp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-  gyropitch=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-  gyroroll=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-  gyroyaw=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
-
-  // Check GyroAxisCal assignment, might cause issues
-  gyropitch = gyropitch-GyroAxisCal[2];
-  gyroroll = gyroroll-GyroAxisCal[1];
-  gyroyaw = gyroyaw-GyroAxisCal[3];
-
-  acc_x = AcX;
-  acc_y = AcY;
-  acc_z = AcZ;
-  
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//Sliding Mode Controller
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void smc(){
-
-  //Desired Angular Acceleration [rad/s2]//
-  pitchDesD2 = (pitchDesD1 - pitchDesD1old)/dt;
-  rollDesD2 = (rollDesD1 - rollDesD1old)/dt;
-  yawDesD2 = (yawDesD1 - yawDesD1old)/dt;
-
-  //Desired Angular Velocity [rad/s]//
-  pitchDesD1 = (R2-1500)*maxPitch/500;
-  rollDesD1 = (R1-1500)*maxRoll/500;
-  yawDesD1 = (R4-1500)*maxYaw/500;
-
-  //Transmitter Dead Band//
-  pitchDesD1 = (abs(pitchDesD1) < 5*deg2rad) ? 0 : pitchDesD1;
-  rollDesD1 = (abs(rollDesD1) < 5*deg2rad) ? 0 : rollDesD1;
-  yawDesD1 = (abs(yawDesD1) < 5*deg2rad) ? 0 : yawDesD1;
-
-  //Desired Angular Position [rad]//
-  pitchDes=0;
-  rollDes=0;
-  yawDes+=yawDesD1*dt;
- 
-  //Error Calculations [rad]//
-  ePitch = pitchDes - pitch;
-  eRoll = rollDes - roll;
-  eYaw =  yawDes - yaw;
-  
-  //Error Time Derivatives [rad/s]//
-  ePitchD1 = pitchDesD1 - pitchD1;
-  eRollD1 = rollDesD1 - rollD1;  
-  eYawD1 = yawDesD1 - yawD1;
-
-  //Sliding Surfaces//
-  sPitch = cPitch*ePitch + ePitchD1;
-  sRoll = cRoll*eRoll + eRollD1;
-  sYaw = cYaw*eYaw + eYawD1;
-  
-  //Sliding Surface Saturation//
-  sPitch = (sPitch > satBound) ? satBound : (sPitch < -satBound) ? -satBound : sPitch;
-  sRoll = (sRoll > satBound) ? satBound : (sRoll < -satBound) ? -satBound : sRoll;
-  sYaw = (sYaw > satBound) ? satBound : (sYaw < -satBound) ? -satBound : sYaw;
-
-  //Thrust Inputs//
-  throttle = (throttle > 1800) ? 1800 : throttle; // Need room to control
-  u1 = 4.0*Kf*((throttle-1000)*vMax/1000.0)*((throttle-1000)*vMax/1000.0); // [N] Heave
-  u2 = ((kPitch*sPitch) + (cPitch*ePitchD1) + pitchDesD2 - (a1*rollD1*yawD1))/b1; // [Nm] Pitch Torque
-  u3 = ((kRoll*sRoll) + (cRoll*eRollD1) + rollDesD2 - (a3*pitchD1*yawD1))/b2; // [Nm] Roll Torque
-  u4 = ((kYaw*sYaw) + (cYaw*eYawD1) + yawDesD2 - (a5*pitchD1*rollD1))/b3; // [Nm] Yaw Torque
-
-  //Rotor Velocities [rad/s]//
-  w1 = sqrt((u1+2*u2)/Kf + u4/Km)/2; // Front (CCW)
-  w2 = sqrt((u1-2*u3)/Kf - u4/Km)/2; // Right (CW)
-  w3 = sqrt((u1-2*u2)/Kf + u4/Km)/2; // Back (CCW)
-  w4 = sqrt((u1+2*u3)/Kf - u4/Km)/2; // Left (CW)
-
-  //Remove Negative Values//
-  w1 = (w1 < 0) ? 0 : w1;
-  w2 = (w2 < 0) ? 0 : w2;
-  w3 = (w3 < 0) ? 0 : w3;
-  w4 = (w4 < 0) ? 0 : w4;
-  
-  //ESC Pulse Widths [us]//
-  esc1 = w1*1000.0/vMax + 1000.0; // Front (CCW)
-  esc2 = w2*1000.0/vMax + 1000.0; // Right (CW)
-  esc3 = w3*1000.0/vMax + 1000.0; // Back (CCW)
-  esc4 = w4*1000.0/vMax + 1000.0; // Left (CW)
-
-  //Serial.println(pitch/deg2rad);
-  
-  //Save Last Loop [rad/s]//
-  rollDesD1old=rollDesD1;
-  pitchDesD1old=pitchDesD1;
-  yawDesD1old=yawDesD1;
-
- 
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//Convert Receiver Signals
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-//This part uses data stored in the EEPROM to convert the actual receiver signals to a standardized 1000 – 1500 – 2000 microsecond value.
-
-int convertReceiver(byte function){
-  byte channel, reverse;                                                       //First we declare some local variables
-  int low, center, high, actual;
-  int difference;
-
-  channel = eeData[function + 23] & 0b00000111;                           //What channel corresponds with the specific function
-  if(eeData[function + 23] & 0b10000000)reverse = 1;                      //Reverse channel when most significant bit is set
-  else reverse = 0;                                                            //If the most significant is not set there is no reverse
-
-  actual = receiverIN[channel];                                            //Read the actual receiver value for the corresponding function
-  low = (eeData[channel * 2 + 15] << 8) | eeData[channel * 2 + 14];        //Store the low value for the specific receiver input channel
-  center = (eeData[channel * 2 - 1] << 8) | eeData[channel * 2 - 2];       //Store the center value for the specific receiver input channel
-  high = (eeData[channel * 2 + 7] << 8) | eeData[channel * 2 + 6];         //Store the high value for the specific receiver input channel
-
-  if(actual < center){                                                         //The actual receiver value is lower than the center value
-    if(actual < low)actual = low;                                              //Limit the lowest value to the value that was detected during setup
-    difference = ((long)(center - actual) * (long)500) / (center - low);       //Calculate and scale the actual value to a 1000 - 2000us value
-    if(reverse == 1)return 1500 + difference;                                  //If the channel is reversed
-    else return 1500 - difference;                                             //If the channel is not reversed
-  }
-  else if(actual > center){                                                    //The actual receiver value is higher than the center value
-    if(actual > high)actual = high;                                            //Limit the lowest value to the value that was detected during setup
-    difference = ((long)(actual - center) * (long)500) / (high - center);      //Calculate and scale the actual value to a 1000 - 2000us value
-    if(reverse == 1)return 1500 - difference;                                  //If the channel is reversed
-    else return 1500 + difference;                                             //If the channel is not reversed
-  }
-  else return 1500;
-}
-
-void gyroRegisters(){ //Teensy Components Added
-  //Setup the MPU-6050
-  if(eeData[31] == 1){
-    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
-    Wire.write(0x6B); //We want to write to the PWR_MGMT_1 register (6B hex)
-    Wire.write(0x00); //Set the register bits as 00000000 to activate the gyro
-    Wire.endTransmission(); //End the transmission with the gyro.
-
-    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
-    Wire.write(0x1B); //We want to write to the GYRO_CONFIG register (1B hex)
-    Wire.write(0b00001000); //Set the register bits as 00001000 (500dps full scale)
-    Wire.endTransmission(); //End the transmission with the gyro
-
-    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
-    Wire.write(0x1C); //We want to write to the ACCEL_CONFIG register (1A hex)
-    Wire.write(0b00010000); //Set the register bits as 00010000 (+/- 8g full scale range)
-    Wire.endTransmission(); //End the transmission with the gyro
-
-    //Let's perform a random register check to see if the values are written correct
-    Wire.beginTransmission(gAdd);                                              //Start communication with the address found during search
-    Wire.write(0x1B);                                                          //Start reading @ register 0x1B
-    Wire.endTransmission();                                                    //End the transmission
-    Wire.requestFrom(gAdd, 1);                                                 //Request 1 bytes from the gyro
-    while(Wire.available() < 1);                                               //Wait until the 6 bytes are received
-    if(Wire.read() != 0x08){                                                   //Check if the value is 0x08
-      digitalWrite(13,HIGH);                                                   //Turn on the warning led
-      while(1)delay(10);                                                       //Stay in this loop for ever
-    }
-
-   Wire.beginTransmission(gAdd); //Start communication with the address found during search
-   Wire.write(0x1A); //We want to write to the CONFIG register (1A hex)
-   Wire.write(0b00000011); //Set the register bits as 00000011 (Set Digital Low Pass Filter to ~43Hz)
-   Wire.endTransmission(); //End the transmission with the gyro
-
-   // Not sure what this is. Both the line above and the one shown below are in the Github Teensy Flight Controller //
-   Wire.beginTransmission(gAdd); //Start communication with the address found during search
-   Wire.write(0x24);  // I2C Control
-   Wire.write(0b00001001);  // 500kHz
-   Wire.endTransmission(); //End the transmission with the gyro 
-
-  }  
-}
-
-//////////////////////////////////////////////////////////////////////////
-// Interrupts
-//////////////////////////////////////////////////////////////////////////
-
- // Get pulse timing for each of the rx channels
  void ch5Int(){
   if (digitalReadFast(ch5)){
     prev5 = micros();
@@ -769,3 +525,152 @@ void gyroRegisters(){ //Teensy Components Added
     R4 = micros() - prev4;
    }
  }
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Reading Gyroscope and Accelerometer Angles
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void gyro_signalen(){
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+  accX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
+  accY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+  accZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+  temp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+  GyX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+  GyY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+  GyZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+
+  gyroRoll = (GyY-GyY_Cal)/gyroSense;
+  gyroPitch = (GyX-GyX_Cal)/gyroSense;
+  gyroYaw = (GyZ-GyZ_Cal)/gyroSense;
+
+}
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Sliding Mode Controller
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void smc(){
+
+  //Desired Angular Acceleration [rad/s2]//
+  pitchDesD2 = (pitchDesD1 - pitchDesD1old)/dt;
+  rollDesD2 = (rollDesD1 - rollDesD1old)/dt;
+  yawDesD2 = (yawDesD1 - yawDesD1old)/dt;
+
+  //Desired Angular Velocity [rad/s]//
+  pitchDesD1 = -(R2-1500.0)*maxPitch/500.0;
+  rollDesD1 = (R1-1500.0)*maxRoll/500.0;
+  yawDesD1 = (R4-1500.0)*maxYaw/500.0;
+
+  //Transmitter Dead Band//
+  pitchDesD1 = (abs(pitchDesD1) < 10.0*deg2rad) ? 0 : pitchDesD1;
+  rollDesD1 = (abs(rollDesD1) < 10.0*deg2rad) ? 0 : rollDesD1;
+  yawDesD1 = (abs(yawDesD1) < 10.0*deg2rad) ? 0 : yawDesD1;
+
+  //Desired Angular Position [rad]//
+  pitchDes=0;
+  rollDes=0;
+  yawDes+=yawDesD1*dt;
+ 
+  //Error Calculations [rad]//
+  ePitch = pitchDes - pitch;
+  eRoll = rollDes - roll;
+  eYaw =  yawDes - yaw;
+  eYaw = 0;
+  
+  //Error Time Derivatives [rad/s]//
+  ePitchD1 = pitchDesD1 - pitchD1;
+  eRollD1 = rollDesD1 - rollD1;  
+  eYawD1 = yawDesD1 - yawD1;
+
+  //Sliding Surfaces//
+  sPitch = cPitch*ePitch + ePitchD1;
+  sRoll = cRoll*eRoll + eRollD1;
+  sYaw = cYaw*eYaw + eYawD1;
+  
+  //Sliding Surface Saturation//
+  sPitch = (sPitch > satBound) ? satBound : (sPitch < -satBound) ? -satBound : sPitch;
+  sRoll = (sRoll > satBound) ? satBound : (sRoll < -satBound) ? -satBound : sRoll;
+  sYaw = (sYaw > satBound) ? satBound : (sYaw < -satBound) ? -satBound : sYaw;
+
+  //Thrust Inputs//
+  throttle = (throttle > 1800.0) ? 1800.0 : throttle; // Need room to control
+  u1 = 4.0*Kf*((throttle-1000.0)*vMax/1000.0)*((throttle-1000.0)*vMax/1000.0); // [N] Heave
+  u2 = ((kPitch*sPitch) + (cPitch*ePitchD1) + pitchDesD2 - (a1*rollD1*yawD1))/b1; // [Nm] Pitch Torque
+  u3 = ((kRoll*sRoll) + (cRoll*eRollD1) + rollDesD2 - (a3*pitchD1*yawD1))/b2; // [Nm] Roll Torque
+  u4 = ((kYaw*sYaw) + (cYaw*eYawD1) + yawDesD2 - (a5*pitchD1*rollD1))/b3; // [Nm] Yaw Torque
+
+  //Rotor Velocities [rad/s]//
+  w1 = sqrt((u1+2*u2)/Kf - u4/Km)/2; // Front (CCW)
+  w2 = sqrt((u1-2*u3)/Kf + u4/Km)/2; // Right (CW)
+  w3 = sqrt((u1-2*u2)/Kf - u4/Km)/2; // Back (CCW)
+  w4 = sqrt((u1+2*u3)/Kf + u4/Km)/2; // Left (CW)
+
+  if(isnan(w1)){
+    w1 = 0;
+  }
+    if(isnan(w2)){
+    w2 = 0;
+  }
+    if(isnan(w3)){
+    w3 = 0;
+  }
+    if(isnan(w4)){
+    w4 = 0;
+  }
+  
+  //ESC Pulse Widths [us]//
+  esc1 = w1*1000.0/vMax + 1000.0; // Front (CCW)
+  esc2 = w2*1000.0/vMax + 1000.0; // Right (CW)
+  esc3 = w3*1000.0/vMax + 1000.0; // Back (CCW)
+  esc4 = w4*1000.0/vMax + 1000.0; // Left (CW)
+  
+  //Save Last Loop [rad/s]//
+  rollDesD1old=rollDesD1;
+  pitchDesD1old=pitchDesD1;
+  yawDesD1old=yawDesD1;
+ 
+}
+
+void gyroRegisters(){
+  //Setup the MPU-6050
+    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
+    Wire.write(0x6B); //We want to write to the PWR_MGMT_1 register (6B hex)
+    Wire.write(0x00); //Set the register bits as 00000000 to activate the gyro
+    Wire.endTransmission(); //End the transmission with the gyro.
+
+    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
+    Wire.write(0x1B); //We want to write to the GYRO_CONFIG register (1B hex)
+    Wire.write(0b00001000); //Set the register bits as 00001000 (500dps full scale)
+    Wire.endTransmission(); //End the transmission with the gyro
+
+    Wire.beginTransmission(gAdd); //Start communication with the address found during search.
+    Wire.write(0x1C); //We want to write to the ACCEL_CONFIG register (1A hex)
+    Wire.write(0b00010000); //Set the register bits as 00010000 (+/- 8g full scale range)
+    Wire.endTransmission(); //End the transmission with the gyro
+
+    //Let's perform a random register check to see if the values are written correct
+    Wire.beginTransmission(gAdd); //Start communication with the address found during search
+    Wire.write(0x1B); //Start reading @ register 0x1B
+    Wire.endTransmission(); //End the transmission
+    Wire.requestFrom(gAdd, 1); //Request 1 bytes from the gyro
+    while(Wire.available() < 1); //Wait until the 6 bytes are received
+    if(Wire.read() != 0x08){ //Check if the value is 0x08
+      digitalWrite(13,HIGH); //Turn on the warning led
+      while(1)delay(10); //Stay in this loop for ever
+    }
+
+   Wire.beginTransmission(gAdd); //Start communication with the address found during search
+   Wire.write(0x1A); //We want to write to the CONFIG register (1A hex)
+   Wire.write(0b00000011); //Set the register bits as 00000011 (Set Digital Low Pass Filter to ~43Hz)
+   Wire.endTransmission(); //End the transmission with the gyro
+
+   Wire.beginTransmission(gAdd); //Start communication with the address found during search
+   Wire.write(0x24);  // I2C Control
+   Wire.write(0b00001001);  // 500kHz
+   Wire.endTransmission(); //End the transmission with the gyro
+}
